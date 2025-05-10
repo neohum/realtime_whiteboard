@@ -424,13 +424,121 @@
                 }, 5000);
             }
             
-            // 소켓 연결
-            const socket = io(serverUrl, {
-                transports: ['websocket', 'polling'],
-                withCredentials: false
-            });
-            
-            console.log('소켓 연결 시도 중...');
+            // 소켓 연결 설정
+            let socket;
+            let reconnectAttempts = 0;
+            const maxReconnectAttempts = 5;
+
+            function connectSocket() {
+                try {
+                    // 소켓 연결 시도
+                    socket = io({
+                        reconnectionAttempts: 5,
+                        reconnectionDelay: 1000,
+                        timeout: 10000
+                    });
+                    
+                    // 소켓 이벤트 리스너
+                    socket.on('connect', () => {
+                        updateConnectionStatus('연결됨', 'green');
+                        console.log('서버에 연결되었습니다.');
+                        reconnectAttempts = 0;
+                        
+                        // 방 입장
+                        socket.emit('joinRoom', roomCode);
+                        
+                        // 주기적으로 연결 상태 확인
+                        setInterval(() => {
+                            if (socket.connected) {
+                                socket.emit('ping', (data) => {
+                                    console.log('서버 ping 응답 수신:', data);
+                                    // 사용자 수 업데이트
+                                    if (data && data.roomUsers) {
+                                        usersCount.textContent = data.roomUsers;
+                                    }
+                                });
+                            }
+                        }, 30000); // 30초마다 ping
+                    });
+                    
+                    socket.on('connect_error', (error) => {
+                        updateConnectionStatus('연결 오류', 'red');
+                        console.error('연결 오류:', error);
+                        
+                        reconnectAttempts++;
+                        if (reconnectAttempts > maxReconnectAttempts) {
+                            showError('서버 연결에 실패했습니다. 페이지를 새로고침하거나 나중에 다시 시도해주세요.');
+                        }
+                    });
+                    
+                    socket.on('disconnect', (reason) => {
+                        updateConnectionStatus('연결 끊김', 'red');
+                        console.log('연결이 끊어졌습니다:', reason);
+                    });
+                    
+                    socket.on('error', (data) => {
+                        console.error('서버 오류:', data);
+                        showError(data.message || '오류가 발생했습니다.');
+                    });
+                    
+                    // 오류 발생 시 자동 재연결 시도
+                    socket.io.on('reconnect_attempt', (attempt) => {
+                        console.log(`재연결 시도 중... (${attempt}/${socket.io.reconnectionAttempts})`);
+                        updateConnectionStatus(`재연결 중... (${attempt})`, 'orange');
+                    });
+                    
+                    socket.io.on('reconnect', () => {
+                        console.log('서버에 재연결되었습니다.');
+                        updateConnectionStatus('연결됨', 'green');
+                        
+                        // 방 재입장
+                        socket.emit('joinRoom', roomCode);
+                    });
+                    
+                    socket.io.on('reconnect_failed', () => {
+                        console.error('재연결 실패');
+                        updateConnectionStatus('재연결 실패', 'red');
+                        showError('서버 연결에 실패했습니다. 페이지를 새로고침해 주세요.');
+                    });
+                } catch (error) {
+                    console.error('소켓 연결 초기화 오류:', error);
+                    updateConnectionStatus('연결 오류', 'red');
+                    showError('서버 연결 초기화 중 오류가 발생했습니다. 페이지를 새로고침해 주세요.');
+                }
+            }
+
+            // 페이지 로드 시 소켓 연결
+            connectSocket();
+
+            // 오류 메시지 표시 함수
+            function showError(message) {
+                const errorContainer = document.getElementById('errorContainer') || createErrorContainer();
+                errorContainer.textContent = message;
+                errorContainer.style.display = 'block';
+                
+                // 5초 후 자동으로 숨김
+                setTimeout(() => {
+                    errorContainer.style.display = 'none';
+                }, 5000);
+            }
+
+            // 오류 컨테이너 생성 함수
+            function createErrorContainer() {
+                const container = document.createElement('div');
+                container.id = 'errorContainer';
+                container.style.position = 'fixed';
+                container.style.top = '10px';
+                container.style.left = '50%';
+                container.style.transform = 'translateX(-50%)';
+                container.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+                container.style.color = 'white';
+                container.style.padding = '10px 20px';
+                container.style.borderRadius = '5px';
+                container.style.zIndex = '1000';
+                container.style.display = 'none';
+                document.body.appendChild(container);
+                return container;
+            }
             
             // 연결 상태 표시 요소
             const connectionStatus = document.getElementById('connectionStatus');
@@ -1083,6 +1191,8 @@
         }
     }
 </style>
+
+
 
 
 

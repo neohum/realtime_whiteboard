@@ -1,4 +1,5 @@
 const PORT = process.env.PORT || 3000;
+const DOMAIN = process.env.DOMAIN || 'https://rboard.schoolworks.dev';
 
 const express = require('express');
 const http = require('http');
@@ -8,29 +9,476 @@ const fs = require('fs');
 const { createClient } = require('redis');
 const cors = require('cors');
 
+// 환경 설정 로깅
+console.log('서버 환경 설정:');
+console.log(`- 포트: ${PORT}`);
+console.log(`- 도메인: ${DOMAIN}`);
+console.log(`- 환경: ${process.env.NODE_ENV || 'development'}`);
+
 const app = express();
 const server = http.createServer(app);
 
-// CORS 설정 및 CDN 허용
-app.use((req, res, next) => {
-    // CORS 헤더 설정
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+// CORS 설정 - 프로덕션 환경에서는 특정 도메인만 허용
+app.use(cors({
+    origin: process.env.NODE_ENV === 'production' 
+        ? ['https://rboard.schoolworks.dev'] 
+        : '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Accept'],
+    credentials: true
+}));
+
+// JSON 파싱 미들웨어
+app.use(express.json());
+
+// 정적 파일 제공 설정
+const frontendPath = path.join(__dirname, '../frontend');
+console.log('프론트엔드 경로:', frontendPath);
+
+app.use(express.static(frontendPath, {
+    maxAge: '1h',
+    setHeaders: (res, path) => {
+        if (path.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+        }
+    }
+}));
+
+// 로그 파일 설정
+const logDir = path.join(__dirname, '../logs');
+if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+}
+
+const logFile = fs.createWriteStream(
+    path.join(logDir, `server-${new Date().toISOString().split('T')[0]}.log`),
+    { flags: 'a' }
+);
+
+// 로그 기록 함수
+function logToFile(message) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}\n`;
+    logFile.write(logMessage);
     
-    // Content-Security-Policy 헤더 설정 - CDN 허용
-    res.setHeader(
-        'Content-Security-Policy',
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.socket.io https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:;"
-    );
+    // 개발 환경에서는 콘솔에도 출력
+    if (process.env.NODE_ENV !== 'production') {
+        console.log(`[LOG] ${message}`);
+    }
+}
+
+// 서버 시작 로그
+logToFile(`서버 시작 - 포트: ${PORT}, 도메인: ${DOMAIN}`);
+
+// Redis 클라이언트 설정
+let redisClient = null;
+let redisEnabled = false;
+
+// Redis 연결 설정 (선택적)
+(async () => {
+    try {
+        // 프로덕션 환경에서만 Redis 연결 시도
+        if (process.env.NODE_ENV === 'production' && process.env.REDIS_URL) {
+            redisClient = createClient({
+                url: process.env.REDIS_URL,
+                socket: {
+                    connectTimeout: 3000, // 3초 연결 타임아웃
+                    reconnectStrategy: (retries) => {
+                        if (retries > 3) {
+                            console.log('Redis 재연결 시도 중단 (3회 초과)');
+                            return new Error('Redis 연결 실패');
+                        }
+                        return Math.min(retries * 100, 1000); // 최대 1초 대기
+                    }
+                }
+            });
+
+            redisClient.on('error', (err) => {
+                console.error(`Redis 연결 오류: ${err}`);
+                logToFile(`Redis 연결 오류: ${err}`);
+                redisEnabled = false;
+            });
+
+            redisClient.on('connect', () => {
+                console.log('Redis 서버에 연결되었습니다.');
+                logToFile('Redis 서버에 연결되었습니다.');
+                redisEnabled = true;
+            });
+
+            // 3초 타임아웃으로 연결 시도
+            const connectPromise = redisClient.connect();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Redis 연결 시간 초과')), 3000)
+            );
+            
+            await Promise.race([connectPromise, timeoutPromise]);
+            
+            console.log('Redis 연결 성공');
+            logToFile('Redis 연결 성공');
+            redisEnabled = true;
+        } else {
+            console.log('Redis 연결을 건너뜁니다. 메모리 저장소만 사용합니다.');
+            logToFile('Redis 연결을 건너뜁니다. 메모리 저장소만 사용합니다.');
+        }
+    } catch (error) {
+        console.error('Redis 연결 실패:', error);
+        logToFile(`Redis 연결 실패: ${error.message}`);
+        console.log('Redis 없이 서버를 계속 실행합니다. 메모리 저장소만 사용됩니다.');
+        redisEnabled = false;
+        redisClient = null;
+    }
+})();
+
+// Redis 사용 가능 여부 확인 함수
+function isRedisAvailable() {
+    return redisEnabled && redisClient && redisClient.isOpen;
+}
+
+// 메모리 저장소 초기화
+const rooms = {};
+const userRooms = new Map();
+let connectedClients = 0;
+
+// 방 코드 생성 함수
+async function createUniqueRoomCode() {
+    let roomCode;
+    let exists = true;
     
-    next();
+    while (exists) {
+        // 6자리 숫자 코드 생성
+        roomCode = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        // 방 존재 여부 확인
+        const roomInfo = await getRoomInfo(roomCode);
+        exists = !!roomInfo;
+    }
+    
+    return roomCode;
+}
+
+// 방 생성 함수
+async function createRoom(roomCode) {
+    const now = Date.now();
+    
+    // 메모리에 방 정보 저장
+    rooms[roomCode] = {
+        createdAt: now,
+        lastActive: now,
+        users: 0
+    };
+    
+    // Redis에 방 정보 저장
+    try {
+        if (isRedisAvailable()) {
+            const roomKey = `room:${roomCode}`;
+            
+            await redisClient.hSet(roomKey, {
+                createdAt: now,
+                lastActive: now,
+                users: 0
+            });
+            
+            // 24시간 후 만료 설정
+            await redisClient.expire(roomKey, 24 * 60 * 60);
+            
+            console.log(`Redis에 방 정보 저장 완료: ${roomCode}`);
+        }
+    } catch (error) {
+        console.error(`Redis 방 정보 저장 오류:`, error);
+        logToFile(`Redis 방 정보 저장 오류: ${error.message}`);
+    }
+    
+    return rooms[roomCode];
+}
+
+// 방 정보 조회 함수 - 오류 처리 강화
+async function getRoomInfo(roomCode) {
+    try {
+        // 메모리에서 방 정보 확인
+        if (rooms[roomCode]) {
+            return rooms[roomCode];
+        }
+        
+        // Redis에서 방 정보 확인
+        if (isRedisAvailable()) {
+            try {
+                const roomKey = `room:${roomCode}`;
+                const exists = await redisClient.exists(roomKey);
+                
+                if (exists) {
+                    const roomData = await redisClient.hGetAll(roomKey);
+                    
+                    // 문자열을 숫자로 변환
+                    roomData.createdAt = parseInt(roomData.createdAt) || Date.now();
+                    roomData.lastActive = parseInt(roomData.lastActive) || Date.now();
+                    roomData.users = parseInt(roomData.users) || 0;
+                    
+                    // 메모리에 캐싱
+                    rooms[roomCode] = roomData;
+                    
+                    return roomData;
+                }
+            } catch (error) {
+                console.error(`Redis 방 정보 조회 오류:`, error);
+                logToFile(`Redis 방 정보 조회 오류: ${error.message}`);
+                // Redis 오류 시 null 반환 (방 생성 필요)
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error(`방 정보 조회 중 예외 발생:`, error);
+        logToFile(`방 정보 조회 중 예외 발생: ${error.message}`);
+        // 오류 발생 시 기본 방 정보 반환
+        return {
+            createdAt: Date.now(),
+            lastActive: Date.now(),
+            users: 0
+        };
+    }
+}
+
+// 그리기 데이터 저장 함수
+async function saveDrawingPoint(roomCode, point) {
+    try {
+        if (redisClient.isOpen) {
+            const pointsKey = `room:${roomCode}:points`;
+            
+            // 그리기 데이터를 JSON 문자열로 변환하여 저장
+            await redisClient.rPush(pointsKey, JSON.stringify(point));
+            
+            // 24시간 후 만료 설정
+            await redisClient.expire(pointsKey, 24 * 60 * 60);
+        }
+    } catch (error) {
+        console.error(`그리기 데이터 저장 오류:`, error);
+        logToFile(`그리기 데이터 저장 오류: ${error.message}`);
+    }
+}
+
+// 그리기 데이터 조회 함수 - 오류 처리 강화
+async function getDrawingPoints(roomCode) {
+    try {
+        if (isRedisAvailable()) {
+            const pointsKey = `room:${roomCode}:points`;
+            
+            // Redis에서 그리기 데이터 조회
+            const pointsData = await redisClient.lRange(pointsKey, 0, -1);
+            
+            // JSON 문자열을 객체로 변환
+            return pointsData.map(point => {
+                try {
+                    return JSON.parse(point);
+                } catch (e) {
+                    console.error('그리기 데이터 파싱 오류:', e);
+                    return null;
+                }
+            }).filter(point => point !== null);
+        }
+    } catch (error) {
+        console.error(`그리기 데이터 조회 오류:`, error);
+        logToFile(`그리기 데이터 조회 오류: ${error.message}`);
+    }
+    
+    return [];
+}
+
+// 그리기 데이터 삭제 함수
+async function clearDrawingPoints(roomCode) {
+    try {
+        if (redisClient.isOpen) {
+            const pointsKey = `room:${roomCode}:points`;
+            
+            // Redis에서 그리기 데이터 삭제
+            await redisClient.del(pointsKey);
+            console.log(`방 ${roomCode}의 그리기 데이터 삭제 완료`);
+        }
+    } catch (error) {
+        console.error(`그리기 데이터 삭제 오류:`, error);
+        logToFile(`그리기 데이터 삭제 오류: ${error.message}`);
+    }
+}
+
+// 이미지 데이터 저장 함수
+async function saveImage(roomCode, imageData) {
+    try {
+        if (redisClient.isOpen) {
+            const imagesKey = `room:${roomCode}:images`;
+            
+            // 이미지 데이터를 JSON 문자열로 변환하여 저장
+            await redisClient.rPush(imagesKey, JSON.stringify(imageData));
+            
+            // 24시간 후 만료 설정
+            await redisClient.expire(imagesKey, 24 * 60 * 60);
+            
+            return true;
+        }
+    } catch (error) {
+        console.error(`이미지 데이터 저장 오류:`, error);
+        logToFile(`이미지 데이터 저장 오류: ${error.message}`);
+    }
+    
+    return false;
+}
+
+// 이미지 데이터 조회 함수 - 오류 처리 강화
+async function getImages(roomCode) {
+    try {
+        if (isRedisAvailable()) {
+            const imagesKey = `room:${roomCode}:images`;
+            
+            // Redis에서 이미지 데이터 조회
+            const imagesData = await redisClient.lRange(imagesKey, 0, -1);
+            
+            // JSON 문자열을 객체로 변환
+            return imagesData.map(image => {
+                try {
+                    return JSON.parse(image);
+                } catch (e) {
+                    console.error('이미지 데이터 파싱 오류:', e);
+                    return null;
+                }
+            }).filter(image => image !== null);
+        }
+    } catch (error) {
+        console.error(`이미지 데이터 조회 오류:`, error);
+        logToFile(`이미지 데이터 조회 오류: ${error.message}`);
+    }
+    
+    return [];
+}
+
+// 이미지 데이터 삭제 함수
+async function clearImages(roomCode) {
+    try {
+        if (redisClient.isOpen) {
+            const imagesKey = `room:${roomCode}:images`;
+            
+            // Redis에서 이미지 데이터 삭제
+            await redisClient.del(imagesKey);
+            console.log(`방 ${roomCode}의 이미지 데이터 삭제 완료`);
+        }
+    } catch (error) {
+        console.error(`이미지 데이터 삭제 오류:`, error);
+        logToFile(`이미지 데이터 삭제 오류: ${error.message}`);
+    }
+}
+
+// API 라우트 정의 - 최상위에 배치
+// 헬스 체크 API
+app.get('/api/health', (req, res) => {
+    console.log('헬스 체크 요청 받음:', req.ip);
+    
+    try {
+        // 응답 헤더 설정
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        
+        // 응답 전송
+        res.status(200).json({
+            status: 'ok',
+            message: '서버가 정상적으로 실행 중입니다.',
+            timestamp: new Date().toISOString(),
+            domain: DOMAIN
+        });
+        
+        console.log('헬스 체크 응답 전송 완료');
+    } catch (error) {
+        console.error('헬스 체크 처리 중 오류:', error);
+        res.status(500).json({
+            status: 'error',
+            message: '서버 상태 확인 중 오류가 발생했습니다.'
+        });
+    }
+});
+
+// 새 방 생성 API - 단순화 및 최적화
+app.get('/api/create-room', (req, res) => {
+    try {
+        console.log('방 생성 요청 받음:', req.ip);
+        
+        // 6자리 숫자 코드 생성 (간단한 방식으로 변경)
+        const roomCode = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        // 메모리에 방 정보 저장 (즉시)
+        const now = Date.now();
+        rooms[roomCode] = {
+            createdAt: now,
+            lastActive: now,
+            users: 0
+        };
+        
+        console.log(`새 방 생성됨: ${roomCode}`);
+        logToFile(`API 호출로 새 방 생성: ${roomCode}`);
+        
+        // 응답 헤더 설정
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        
+        // 즉시 응답 전송
+        res.status(200).json({ roomCode });
+        
+        // Redis에 방 정보 저장 (비동기로 처리, 응답 후)
+        if (redisClient && redisClient.isOpen) {
+            const roomKey = `room:${roomCode}`;
+            
+            // 비동기로 Redis 저장 시작 (응답 후)
+            redisClient.hSet(roomKey, {
+                createdAt: now,
+                lastActive: now,
+                users: 0
+            }).then(() => {
+                return redisClient.expire(roomKey, 24 * 60 * 60);
+            }).then(() => {
+                console.log(`Redis에 방 정보 저장 완료: ${roomCode}`);
+            }).catch(error => {
+                console.error(`Redis 방 정보 저장 오류:`, error);
+                logToFile(`Redis 방 정보 저장 오류: ${error.message}`);
+            });
+        }
+    } catch (error) {
+        console.error('방 생성 오류:', error);
+        logToFile(`방 생성 오류: ${error.message}`);
+        res.status(500).json({ error: '방 생성 중 오류가 발생했습니다.' });
+    }
+});
+
+// 방 존재 여부 확인 API - 단순화
+app.get('/api/check-room/:roomCode', (req, res) => {
+    try {
+        const { roomCode } = req.params;
+        console.log(`방 확인 요청 받음: ${roomCode}, IP: ${req.ip}`);
+        
+        // 메모리에서만 확인 (빠름)
+        const exists = !!rooms[roomCode];
+        
+        console.log(`방 ${roomCode} 존재 여부: ${exists}`);
+        logToFile(`방 확인 요청: ${roomCode}, 존재: ${exists}`);
+        
+        // 응답 헤더 설정
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        
+        // 즉시 응답 전송
+        res.status(200).json({ exists });
+    } catch (error) {
+        console.error('방 확인 오류:', error);
+        logToFile(`방 확인 오류: ${error.message}`);
+        res.status(500).json({ error: '방 확인 중 오류가 발생했습니다.' });
+    }
 });
 
 // Socket.IO 설정
 const io = socketIo(server, {
     cors: {
-        origin: "*",
+        origin: process.env.NODE_ENV === 'production' 
+            ? ['https://rboard.schoolworks.dev'] 
+            : "*",
         methods: ["GET", "POST"],
         credentials: true
     },
@@ -39,378 +487,66 @@ const io = socketIo(server, {
     pingInterval: 25000 // 핑 간격 25초로 설정
 });
 
-// 정적 파일 제공
-app.use(express.static(path.join(__dirname, '../frontend')));
-
-// 헬스 체크 API
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', message: '서버가 정상적으로 실행 중입니다.' });
-});
-
-
-
-// 오류 처리
-server.on('error', (error) => {
-    console.error('서버 오류:', error);
-    if (error.code === 'EADDRINUSE') {
-        console.error(`포트 ${PORT}가 이미 사용 중입니다. 다른 포트를 사용하거나 해당 포트를 사용하는 프로세스를 종료하세요.`);
-    }
-});
-
-// Redis 클라이언트 생성 및 연결 설정 수정
-const redisClient = createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379'
-});
-
-// Redis 연결 설정
-(async () => {
-    redisClient.on('error', (err) => {
-        console.error(`Redis 연결 오류: ${err}`);
-        logToFile(`Redis 연결 오류: ${err}`);
-    });
-
-    redisClient.on('connect', () => {
-        console.log('Redis 서버에 연결되었습니다.');
-        logToFile('Redis 서버에 연결되었습니다.');
-    });
-
-    try {
-        await redisClient.connect();
-        console.log('Redis 연결 성공');
-        
-        // Redis 연결 테스트
-        await redisClient.set('test', 'connected');
-        const testValue = await redisClient.get('test');
-        console.log('Redis 연결 테스트:', testValue);
-    } catch (error) {
-        console.error('Redis 연결 실패:', error);
-        logToFile(`Redis 연결 실패: ${error.message}`);
-    }
-})();
-
-// 로그 파일 설정
-const logFile = fs.createWriteStream(path.join(__dirname, 'server.log'), { flags: 'a' });
-
-// 로그 기록 함수
-function logToFile(message) {
-    const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] ${message}\n`;
-    logFile.write(logMessage);
-    console.log(message);
-}
-
-// 방 정보 저장을 위한 객체
-const rooms = {};
-
-// 연결된 클라이언트 수 추적
-let connectedClients = 0;
-
-// 방 참가자 관리를 위한 맵
-const userRooms = new Map(); // 사용자 ID -> 방 코드
-
-// 메모리 저장소 (임시 데이터용)
-const memoryStore = {
-    images: {},  // 방 코드별 이미지 저장: { roomCode: [이미지 데이터 배열] }
-    drawings: {} // 방 코드별 그리기 데이터 저장: { roomCode: [그리기 데이터 배열] }
-};
-
-// 서버 시작 - 기존 코드 유지, 중복 제거
-server.on('listening', () => {
-    console.log(`서버가 ${PORT} 포트에서 실행 중입니다`);
-    console.log(`http://localhost:${PORT}에서 접속 가능합니다`);
-    
-    // 서버 시작 시 초기화
-    connectedClients = 0;
-    
-    // 모든 방 정보 초기화
-    for (const roomCode in rooms) {
-        rooms[roomCode].users = 0;
-    }
-    
-    console.log('서버 상태 초기화 완료');
-});
-
-// 기존 server.listen() 호출은 유지하고, 새로 추가한 것은 제거
-// server.listen(PORT, () => {
-//     console.log(`서버가 ${PORT} 포트에서 실행 중입니다`);
-//     console.log(`http://localhost:${PORT}에서 접속 가능합니다`);
-    
-//     // 서버 시작 시 초기화
-//     connectedClients = 0;
-    
-//     // 모든 방 정보 초기화
-//     for (const roomCode in rooms) {
-//         rooms[roomCode].users = 0;
-//     }
-    
-//     console.log('서버 상태 초기화 완료');
-// });
-
-// 랜덤 6자리 숫자 생성 함수
-function generateRoomCode() {
-    // 100000부터 999999까지의 랜덤 숫자 생성
-    const min = 100000;
-    const max = 999999;
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-// 고유한 방 코드 생성 함수
-async function createUniqueRoomCode() {
-    let roomCode;
-    let exists = true;
-    
-    // 존재하지 않는 방 코드가 나올 때까지 반복
-    while (exists) {
-        roomCode = generateRoomCode().toString();
-        exists = await redisClient.exists(`room:${roomCode}`);
-    }
-    
-    return roomCode;
-}
-
-// 방 생성 함수
-async function createRoom(roomCode) {
-    const roomKey = `room:${roomCode}`;
-    const now = Date.now();
-    const expiryTime = 2 * 60 * 60; // 2시간(초 단위)
-    
-    // 방 기본 정보 설정
-    await redisClient.hSet(roomKey, 'createdAt', now);
-    await redisClient.hSet(roomKey, 'lastActive', now);
-    await redisClient.hSet(roomKey, 'users', 0);
-    
-    // 2시간 후 만료 설정
-    await redisClient.expire(roomKey, expiryTime);
-    
-    logToFile(`새 방 생성: ${roomCode} (만료: 2시간)`);
-    return roomCode;
-}
-
-// 방 정보 가져오기
-async function getRoomInfo(roomCode) {
-    const roomKey = `room:${roomCode}`;
-    const exists = await redisClient.exists(roomKey);
-    
-    if (!exists) {
-        return null;
-    }
-    
-    const roomInfo = await redisClient.hGetAll(roomKey);
-    
-    // 숫자 타입 변환
-    if (roomInfo.users) roomInfo.users = parseInt(roomInfo.users);
-    if (roomInfo.createdAt) roomInfo.createdAt = parseInt(roomInfo.createdAt);
-    if (roomInfo.lastActive) roomInfo.lastActive = parseInt(roomInfo.lastActive);
-    
-    return roomInfo;
-}
-
-// 방 사용자 수 업데이트
-async function updateRoomUsers(roomCode, delta) {
-    const roomKey = `room:${roomCode}`;
-    const exists = await redisClient.exists(roomKey);
-    
-    if (!exists) {
-        return false;
-    }
-    
-    // 현재 사용자 수 가져오기
-    let users = parseInt(await redisClient.hGet(roomKey, 'users') || '0');
-    users += delta;
-    
-    // 사용자 수가 0보다 작아지지 않도록
-    if (users < 0) users = 0;
-    
-    // 사용자 수 업데이트
-    await redisClient.hSet(roomKey, 'users', users);
-    
-    // 마지막 활동 시간 업데이트
-    await redisClient.hSet(roomKey, 'lastActive', Date.now());
-    
-    // 만료 시간 갱신 (사용자가 있는 동안은 만료되지 않도록)
-    if (users > 0) {
-        await redisClient.persist(roomKey);
-    } else {
-        // 사용자가 없으면 2시간 후 만료 설정
-        await redisClient.expire(roomKey, 2 * 60 * 60);
-    }
-    
-    return users;
-}
-
-// 그리기 데이터 저장
-async function saveDrawingPoint(roomCode, point) {
-    try {
-        // 방 코드에 해당하는 그리기 데이터 배열이 없으면 초기화
-        if (!memoryStore.drawings[roomCode]) {
-            memoryStore.drawings[roomCode] = [];
-        }
-        
-        // 그리기 데이터 저장
-        memoryStore.drawings[roomCode].push(point);
-        return true;
-    } catch (error) {
-        console.error(`그리기 데이터 저장 오류:`, error);
-        logToFile(`그리기 데이터 저장 오류: ${error.message}`);
-        return false;
-    }
-}
-
-// 그리기 데이터 가져오기
-async function getDrawingPoints(roomCode) {
-    try {
-        // 방 코드에 해당하는 그리기 데이터 배열이 없으면 빈 배열 반환
-        if (!memoryStore.drawings[roomCode]) {
-            return [];
-        }
-        
-        return memoryStore.drawings[roomCode];
-    } catch (error) {
-        console.error(`그리기 데이터 로드 오류:`, error);
-        logToFile(`그리기 데이터 로드 오류: ${error.message}`);
-        return [];
-    }
-}
-
-// 그리기 데이터 초기화
-async function clearDrawingPoints(roomCode) {
-    try {
-        // 방 코드에 해당하는 그리기 데이터 배열 초기화
-        memoryStore.drawings[roomCode] = [];
-        return true;
-    } catch (error) {
-        console.error(`그리기 데이터 초기화 오류:`, error);
-        logToFile(`그리기 데이터 초기화 오류: ${error.message}`);
-        return false;
-    }
-}
-
-// 이미지 데이터 저장 (Redis 대신 메모리에 저장)
-async function saveImage(roomCode, imageData) {
-    try {
-        // 이미지 데이터가 너무 크면 로그에 전체 데이터를 기록하지 않음
-        const logData = { ...imageData };
-        if (logData.imageData && logData.imageData.length > 100) {
-            logData.imageData = `${logData.imageData.substring(0, 100)}... (${logData.imageData.length} bytes)`;
-        }
-        
-        console.log(`이미지 저장 시도: 방 ${roomCode}, 크기 ${imageData.width}x${imageData.height}`);
-        
-        // 방 코드에 해당하는 이미지 배열이 없으면 초기화
-        if (!memoryStore.images[roomCode]) {
-            memoryStore.images[roomCode] = [];
-        }
-        
-        // 이미지 데이터 저장
-        memoryStore.images[roomCode].push(imageData);
-        
-        const count = memoryStore.images[roomCode].length;
-        console.log(`방 ${roomCode}의 이미지 개수: ${count}`);
-        
-        logToFile(`방 ${roomCode}에 이미지 저장 완료 (크기: ${imageData.width}x${imageData.height}, 총 이미지: ${count}개)`);
-        return true;
-    } catch (error) {
-        console.error(`이미지 저장 오류:`, error);
-        logToFile(`이미지 저장 오류: ${error.message}`);
-        return false;
-    }
-}
-
-// 이미지 데이터 가져오기 (Redis 대신 메모리에서 가져옴)
-async function getImages(roomCode) {
-    try {
-        console.log(`이미지 데이터 로드 시도: 방 ${roomCode}`);
-        
-        // 방 코드에 해당하는 이미지 배열이 없으면 빈 배열 반환
-        if (!memoryStore.images[roomCode]) {
-            console.log(`방 ${roomCode}에 저장된 이미지가 없습니다.`);
-            return [];
-        }
-        
-        const images = memoryStore.images[roomCode];
-        console.log(`방 ${roomCode}에서 로드한 이미지 개수: ${images.length}`);
-        
-        logToFile(`방 ${roomCode}에서 ${images.length}개의 이미지 데이터 로드 완료`);
-        return images;
-    } catch (error) {
-        console.error(`이미지 데이터 로드 오류:`, error);
-        logToFile(`이미지 데이터 로드 오류: ${error.message}`);
-        return [];
-    }
-}
-
-// 이미지 데이터 초기화 (Redis 대신 메모리에서 초기화)
-async function clearImages(roomCode) {
-    try {
-        // 방 코드에 해당하는 이미지 배열 초기화
-        memoryStore.images[roomCode] = [];
-        logToFile(`방 ${roomCode}의 이미지 데이터 초기화 완료`);
-        return true;
-    } catch (error) {
-        console.error(`이미지 데이터 초기화 오류:`, error);
-        logToFile(`이미지 데이터 초기화 오류: ${error.message}`);
-        return false;
-    }
-}
-
-// Express 라우트 추가
-// 새 방 생성 API
-app.get('/api/create-room', async (req, res) => {
-    try {
-        const roomCode = await createUniqueRoomCode();
-        await createRoom(roomCode);
-        logToFile(`API 호출로 새 방 생성: ${roomCode}`);
-        res.json({ roomCode });
-    } catch (error) {
-        logToFile(`방 생성 오류: ${error.message}`);
-        res.status(500).json({ error: '방 생성 중 오류가 발생했습니다.' });
-    }
-});
-
-// 방 존재 여부 확인 API
-app.get('/api/check-room/:roomCode', async (req, res) => {
-    try {
-        const { roomCode } = req.params;
-        const roomInfo = await getRoomInfo(roomCode);
-        const exists = !!roomInfo;
-        
-        logToFile(`방 확인 요청: ${roomCode}, 존재: ${exists}`);
-        res.json({ exists });
-    } catch (error) {
-        logToFile(`방 확인 오류: ${error.message}`);
-        res.status(500).json({ error: '방 확인 중 오류가 발생했습니다.' });
-    }
-});
-
 // 메인 페이지 라우트
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '../frontend/index.html'));
+    const indexPath = path.join(frontendPath, 'index.html');
+    console.log('메인 페이지 제공:', indexPath);
+    res.sendFile(indexPath);
 });
 
-// 방 페이지 라우트
-app.get('/room/:roomCode', async (req, res) => {
+// 방 페이지 라우트 - 오류 처리 강화
+app.get('/room/:roomCode', (req, res) => {
     try {
         const { roomCode } = req.params;
+        console.log(`방 페이지 요청: ${roomCode}`);
         
-        // 방 정보 확인
-        let roomInfo = await getRoomInfo(roomCode);
-        
-        // 방이 존재하지 않으면 생성
-        if (!roomInfo) {
-            await createRoom(roomCode);
+        // 방 정보 확인 (비동기 처리 없이 메모리에서만 확인)
+        if (!rooms[roomCode]) {
+            // 방이 존재하지 않으면 즉시 생성 (메모리에만)
+            const now = Date.now();
+            rooms[roomCode] = {
+                createdAt: now,
+                lastActive: now,
+                users: 0
+            };
+            console.log(`존재하지 않는 방에 접근 시도, 새로 생성: ${roomCode}`);
             logToFile(`존재하지 않는 방에 접근 시도, 새로 생성: ${roomCode}`);
+            
+            // Redis에 방 정보 저장 (비동기로 처리)
+            if (isRedisAvailable()) {
+                const roomKey = `room:${roomCode}`;
+                
+                redisClient.hSet(roomKey, {
+                    createdAt: now,
+                    lastActive: now,
+                    users: 0
+                }).then(() => {
+                    return redisClient.expire(roomKey, 24 * 60 * 60);
+                }).then(() => {
+                    console.log(`Redis에 방 정보 저장 완료: ${roomCode}`);
+                }).catch(error => {
+                    console.error(`Redis 방 정보 저장 오류:`, error);
+                    logToFile(`Redis 방 정보 저장 오류: ${error.message}`);
+                });
+            }
         }
         
-        res.sendFile(path.join(__dirname, '../frontend/room.html'));
+        // 방 페이지 제공
+        const roomPath = path.join(frontendPath, 'room.html');
+        console.log('방 페이지 제공:', roomPath);
+        
+        // 파일 존재 여부 확인
+        if (!fs.existsSync(roomPath)) {
+            console.error(`방 페이지 파일을 찾을 수 없음: ${roomPath}`);
+            return res.status(404).send('방 페이지 파일을 찾을 수 없습니다.');
+        }
+        
+        res.sendFile(roomPath);
     } catch (error) {
+        console.error(`방 페이지 제공 오류:`, error);
         logToFile(`방 페이지 제공 오류: ${error.message}`);
         res.status(500).send('방 접속 중 오류가 발생했습니다.');
     }
-});
-
-// 헬스 체크 API
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', message: '서버가 정상적으로 실행 중입니다.' });
 });
 
 // Socket.IO 연결 처리
@@ -445,7 +581,7 @@ io.on('connection', (socket) => {
         return rooms[roomCode];
     }
     
-    // 방 입장 처리
+    // 방 입장 처리 - 오류 처리 강화
     socket.on('joinRoom', async (roomCode) => {
         try {
             // 이전 방에서 나가기
@@ -465,13 +601,62 @@ io.on('connection', (socket) => {
                 userRooms.delete(socket.id);
             }
             
-            // 방 정보 확인
-            let roomInfo = await getRoomInfo(roomCode);
+            // 방 정보 확인 (메모리에서 먼저 확인)
+            let roomInfo = rooms[roomCode];
+            
+            // 메모리에 없으면 Redis에서 확인 시도
+            if (!roomInfo && isRedisAvailable()) {
+                try {
+                    const roomKey = `room:${roomCode}`;
+                    const exists = await redisClient.exists(roomKey);
+                    
+                    if (exists) {
+                        const roomData = await redisClient.hGetAll(roomKey);
+                        
+                        // 문자열을 숫자로 변환
+                        roomData.createdAt = parseInt(roomData.createdAt) || Date.now();
+                        roomData.lastActive = parseInt(roomData.lastActive) || Date.now();
+                        roomData.users = parseInt(roomData.users) || 0;
+                        
+                        // 메모리에 캐싱
+                        rooms[roomCode] = roomData;
+                        roomInfo = roomData;
+                    }
+                } catch (error) {
+                    console.error(`Redis 방 정보 조회 오류:`, error);
+                    logToFile(`Redis 방 정보 조회 오류: ${error.message}`);
+                    // Redis 오류 시 무시하고 계속 진행
+                }
+            }
             
             // 방이 존재하지 않으면 생성
             if (!roomInfo) {
-                await createRoom(roomCode);
-                roomInfo = await getRoomInfo(roomCode);
+                const now = Date.now();
+                rooms[roomCode] = {
+                    createdAt: now,
+                    lastActive: now,
+                    users: 0
+                };
+                roomInfo = rooms[roomCode];
+                logToFile(`소켓 연결에서 새 방 생성: ${roomCode}`);
+                
+                // Redis에 방 정보 저장 (비동기로 처리)
+                if (isRedisAvailable()) {
+                    const roomKey = `room:${roomCode}`;
+                    
+                    redisClient.hSet(roomKey, {
+                        createdAt: now,
+                        lastActive: now,
+                        users: 0
+                    }).then(() => {
+                        return redisClient.expire(roomKey, 24 * 60 * 60);
+                    }).then(() => {
+                        console.log(`Redis에 방 정보 저장 완료: ${roomCode}`);
+                    }).catch(error => {
+                        console.error(`Redis 방 정보 저장 오류:`, error);
+                        logToFile(`Redis 방 정보 저장 오류: ${error.message}`);
+                    });
+                }
             }
             
             // 새 방에 입장
@@ -493,7 +678,8 @@ io.on('connection', (socket) => {
                 roomCode,
                 id: socket.id, 
                 timestamp: Date.now(),
-                users: actualUsers
+                users: actualUsers,
+                domain: DOMAIN
             });
             
             // 방의 다른 사용자들에게 새 사용자 입장 알림
@@ -503,21 +689,65 @@ io.on('connection', (socket) => {
                 timestamp: Date.now()
             });
             
-            // 방의 그리기 데이터 전송
-            const drawingPoints = await getDrawingPoints(roomCode);
-            socket.emit('loadDrawing', drawingPoints);
-            logToFile(`${drawingPoints.length}개의 그리기 데이터를 클라이언트에 전송했습니다.`);
+            // 방의 그리기 데이터 전송 (오류 처리 강화)
+            try {
+                if (isRedisAvailable()) {
+                    const pointsKey = `room:${roomCode}:points`;
+                    const pointsData = await redisClient.lRange(pointsKey, 0, -1);
+                    
+                    // JSON 문자열을 객체로 변환
+                    const drawingPoints = pointsData.map(point => {
+                        try {
+                            return JSON.parse(point);
+                        } catch (e) {
+                            console.error('그리기 데이터 파싱 오류:', e);
+                            return null;
+                        }
+                    }).filter(point => point !== null);
+                    
+                    socket.emit('loadDrawing', drawingPoints);
+                    logToFile(`${drawingPoints.length}개의 그리기 데이터를 클라이언트에 전송했습니다.`);
+                } else {
+                    socket.emit('loadDrawing', []);
+                }
+            } catch (error) {
+                console.error(`그리기 데이터 로드 오류:`, error);
+                logToFile(`그리기 데이터 로드 오류: ${error.message}`);
+                socket.emit('loadDrawing', []);
+            }
             
-            // 방의 이미지 데이터 전송
-            console.log(`방 ${roomCode}의 이미지 데이터 로드 시도`);
-            const images = await getImages(roomCode);
-            console.log(`방 ${roomCode}에서 로드한 이미지 개수: ${images.length}`);
-            
-            if (images.length > 0) {
-                socket.emit('loadImages', images);
-                logToFile(`${images.length}개의 이미지 데이터를 클라이언트에 전송했습니다.`);
-            } else {
-                logToFile(`방 ${roomCode}에 저장된 이미지가 없습니다.`);
+            // 방의 이미지 데이터 전송 (오류 처리 강화)
+            try {
+                if (isRedisAvailable()) {
+                    console.log(`방 ${roomCode}의 이미지 데이터 로드 시도`);
+                    const imagesKey = `room:${roomCode}:images`;
+                    const imagesData = await redisClient.lRange(imagesKey, 0, -1);
+                    
+                    // JSON 문자열을 객체로 변환
+                    const images = imagesData.map(image => {
+                        try {
+                            return JSON.parse(image);
+                        } catch (e) {
+                            console.error('이미지 데이터 파싱 오류:', e);
+                            return null;
+                        }
+                    }).filter(image => image !== null);
+                    
+                    console.log(`방 ${roomCode}에서 로드한 이미지 개수: ${images.length}`);
+                    
+                    if (images.length > 0) {
+                        socket.emit('loadImages', images);
+                        logToFile(`${images.length}개의 이미지 데이터를 클라이언트에 전송했습니다.`);
+                    } else {
+                        logToFile(`방 ${roomCode}에 저장된 이미지가 없습니다.`);
+                    }
+                } else {
+                    socket.emit('loadImages', []);
+                }
+            } catch (error) {
+                console.error(`이미지 데이터 로드 오류:`, error);
+                logToFile(`이미지 데이터 로드 오류: ${error.message}`);
+                socket.emit('loadImages', []);
             }
         } catch (error) {
             console.error(`방 입장 오류:`, error);
@@ -932,6 +1162,18 @@ process.on('SIGINT', async () => {
 server.listen(PORT, () => {
     console.log(`서버가 ${PORT} 포트에서 실행 중입니다`);
     console.log(`http://localhost:${PORT}에서 접속 가능합니다`);
+    console.log(`도메인: ${DOMAIN}`);
+    
+    // Redis 상태 확인
+    console.log(`Redis 사용 가능 여부: ${isRedisAvailable() ? '예' : '아니오'}`);
+    
+    // 등록된 라우트 출력
+    console.log('등록된 API 엔드포인트:');
+    app._router.stack.forEach(r => {
+        if (r.route && r.route.path) {
+            console.log(`${Object.keys(r.route.methods).join(', ').toUpperCase()} ${r.route.path}`);
+        }
+    });
     
     // 서버 시작 시 초기화
     connectedClients = 0;
@@ -942,4 +1184,34 @@ server.listen(PORT, () => {
     }
     
     console.log('서버 상태 초기화 완료');
+    logToFile('서버 시작 및 초기화 완료');
+});
+
+// 오류 처리 미들웨어 추가
+app.use((err, req, res, next) => {
+    console.error('서버 오류:', err);
+    logToFile(`서버 오류: ${err.message}\n${err.stack}`);
+    
+    res.status(500).json({
+        status: 'error',
+        message: '서버 내부 오류가 발생했습니다.',
+        error: process.env.NODE_ENV === 'production' ? '서버 오류' : err.message
+    });
+});
+
+// 404 처리 미들웨어
+app.use((req, res) => {
+    console.log(`404 Not Found: ${req.method} ${req.url}`);
+    logToFile(`404 Not Found: ${req.method} ${req.url}`);
+    
+    // API 요청인 경우 JSON 응답
+    if (req.url.startsWith('/api/')) {
+        return res.status(404).json({
+            status: 'error',
+            message: '요청한 API 엔드포인트를 찾을 수 없습니다.'
+        });
+    }
+    
+    // 그 외에는 메인 페이지로 리다이렉트
+    res.redirect('/');
 });
